@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+env/
+venv/
+ENV/
+.venv
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific - ignore generated content
+snapshots/
+output/
+logs/
+database/vehicles.db
+database/vehicles.db-journal
+_temp/
+
+# Test data
+test_images/
+test_videos/
+demo/
+
+# Models - KEEP THESE (uncomment if you want to track models)
+# models/
+
+# Database - keep init but ignore data
+# database/init_db.py
+database/*.db
+database/*.db-journal
+
+# Python cache
+*.pyc
