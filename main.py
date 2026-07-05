@@ -132,7 +132,7 @@ class DatabaseManager:
 
 
 class OCREngine:
-    """EasyOCR text extraction engine"""
+    """EasyOCR text extraction engine with enhanced post-processing"""
     
     def __init__(self, use_gpu: bool = None):
         self.reader = None
@@ -148,15 +148,111 @@ class OCREngine:
             print("[INFO] OCR model loaded!")
         return self.reader
     
+    def correct_position_based(self, text: str) -> str:
+        """
+        Apply position-aware character corrections for common OCR mistakes.
+        Indian plate format: AA 00 AA 0000 (2 letters, 2 digits, 2 letters, 4 digits)
+        """
+        if not text or len(text) < 4:
+            return text
+        
+        text = text.upper().strip()
+        result = []
+        
+        for i, char in enumerate(text):
+            if i < 2 or i > 3 and i < 6:  # Letter positions (0-1, 4-5)
+                # Letter positions - fix common confusions
+                if char == '2':
+                    result.append('Z')  # Z commonly confused with 2
+                elif char == '0':
+                    result.append('O')  # O commonly confused with 0
+                elif char == '1':
+                    result.append('I')  # I commonly confused with 1
+                elif char == '5':
+                    result.append('S')  # S commonly confused with 5
+                elif char == '8':
+                    result.append('B')  # B commonly confused with 8
+                else:
+                    result.append(char)
+            else:  # Digit positions (2-3, 6-9)
+                # Digit positions - fix common confusions
+                if char == 'Z':
+                    result.append('2')  # 2 confused as Z
+                elif char == 'O':
+                    result.append('0')  # 0 confused as O
+                elif char == 'I':
+                    result.append('1')  # 1 confused as I
+                elif char == 'S':
+                    result.append('5')  # 5 confused as S
+                elif char == 'B':
+                    result.append('8')  # 8 confused as B
+                else:
+                    result.append(char)
+        
+        return ''.join(result)
+    
+    def validate_indian_plate(self, text: str) -> str:
+        """
+        Validate and format Indian license plate.
+        Formats: AA00AA0000, AA00AAA0000, AA00000000
+        """
+        if not text:
+            return ""
+        
+        # Remove all spaces and special characters
+        cleaned = "".join(c for c in text.upper() if c.isalnum())
+        
+        if len(cleaned) < 4:
+            return ""
+        
+        # Apply position-based corrections
+        corrected = self.correct_position_based(cleaned)
+        
+        # Try to match Indian plate patterns
+        # Pattern 1: AA00AA0000 (10 chars) - Most common
+        if len(corrected) == 10:
+            # Verify format: AA 00 AA 0000
+            if corrected[:2].isalpha() and corrected[2:4].isdigit() and corrected[4:6].isalpha() and corrected[6:].isdigit():
+                return corrected
+        
+        # Pattern 2: AA00AAA0000 (11 chars)
+        if len(corrected) == 11:
+            if corrected[:2].isalpha() and corrected[2:4].isdigit() and corrected[4:7].isalpha() and corrected[7:].isdigit():
+                return corrected
+        
+        # Pattern 3: AA0000 (6 chars) - Old format
+        if len(corrected) == 6:
+            if corrected[:2].isalpha() and corrected[2:].isdigit():
+                return corrected
+        
+        # Try to fix common issues and re-validate
+        # If we have close to valid length, try to fix
+        if 9 <= len(corrected) <= 11:
+            # Try removing extra chars
+            if len(corrected) == 11:
+                # Remove middle character if it doesn't fit
+                test = corrected[:4] + corrected[7:]
+                if test.isalnum():
+                    return self.validate_indian_plate(test)
+            elif len(corrected) == 9:
+                # Try adding a digit or letter
+                test = corrected[:6] + '0' + corrected[6:]
+                return self.validate_indian_plate(test)
+        
+        # Return the best effort cleaned version
+        return corrected if corrected.isalnum() else ""
+    
     def clean_text(self, text: str) -> str:
         if not text:
             return ""
         
         text = text.replace(" ", "")
         cleaned = "".join(char for char in text if char.isalnum())
-        cleaned = self.format_indian_plate(cleaned)
         
-        return cleaned
+        # Validate and format as Indian plate
+        validated = self.validate_indian_plate(cleaned)
+        
+        return validated
     
     def format_indian_plate(self, text: str) -> str:
         if len(text) < 4:
@@ -178,8 +274,8 @@ class OCREngine:
                     if len(rest) >= 2:
                         letters = rest[:2]
                         numbers = rest[2:]
-                        return f"{first_two} {digits} {letters} {numbers}".strip()
-                    return f"{first_two} {digits} {rest}".strip()
+                        return f"{first_two}{digits}{letters}{numbers}".strip()
+                    return f"{first_two}{digits}{rest}".strip()
         
         return text
     
@@ -242,9 +338,72 @@ class PlateDetector:
         self.recent_detections = {}
         self.duplicate_window = 10
         
+        # Multi-frame consensus tracking
+        self.frame_consensus = {}  # {normalized_plate: {'readings': [], 'best_confidence': 0, 'best_text': ''}}
+        self.min_consensus_frames = 2  # Require at least 2 matching readings
+        
         # Track unique vehicles to avoid multiple snapshots
         self.captured_vehicles = {}  # {plate_number: {'frame': frame_count, 'confidence': ocr_conf, 'image': img, 'box': box}}
         self.session_frame_count = 0
+    
+    def normalize_plate(self, plate_text: str) -> str:
+        """Normalize plate text for consistent tracking"""
+        if not plate_text:
+            return ""
+        # Remove spaces, convert to uppercase, keep only alphanumeric
+        normalized = "".join(c.upper() for c in plate_text if c.isalnum())
+        return normalized
+    
+    def add_to_consensus(self, plate_text: str, confidence: float) -> str:
+        """
+        Add a reading to multi-frame consensus.
+        Returns the consensus plate if stable, otherwise empty string.
+        """
+        if not plate_text:
+            return ""
+        
+        normalized = self.normalize_plate(plate_text)
+        if not normalized or len(normalized) < 4:
+            return ""
+        
+        if normalized not in self.frame_consensus:
+            self.frame_consensus[normalized] = {
+                'readings': [],
+                'best_confidence': 0,
+                'best_text': ''
+            }
+        
+        # Add this reading
+        self.frame_consensus[normalized]['readings'].append(confidence)
+        
+        # Update best if this is better
+        if confidence > self.frame_consensus[normalized]['best_confidence']:
+            self.frame_consensus[normalized]['best_confidence'] = confidence
+            self.frame_consensus[normalized]['best_text'] = normalized
+        
+        # Check if we have consensus (multiple consistent readings)
+        if len(self.frame_consensus[normalized]['readings']) >= self.min_consensus_frames:
+            return normalized
+        
+        return ""
+    
+    def get_consensus_plate(self) -> tuple:
+        """Get the best plate from consensus that has stable readings"""
+        best_plate = ""
+        best_confidence = 0
+        
+        for plate, data in self.frame_consensus.items():
+            if len(data['readings']) >= self.min_consensus_frames:
+                avg_conf = sum(data['readings']) / len(data['readings'])
+                if avg_conf > best_confidence:
+                    best_confidence = avg_conf
+                    best_plate = data['best_text']
+        
+        return best_plate, best_confidence
+    
+    def clear_consensus(self):
+        """Clear consensus tracking"""
+        self.frame_consensus = {}
     
     def load_model(self, model_name: str = "yolov8n.pt"):
         """Load YOLOv8 model"""
@@ -572,9 +731,13 @@ def process_video_mode(detector: PlateDetector, video_path: str):
     detections_logged = 0
     frame_skip = 5
     
-    # Reset captured vehicles for this session
+    # Reset captured vehicles and consensus for this session
     detector.captured_vehicles = {}
+    detector.frame_consensus = {}
     detector.session_frame_count = 0
+    
+    # Track pending captures (waiting for consensus)
+    pending_captures = {}  # {normalized_plate: {'image': img, 'box': box, 'ocr_confidence': conf, 'detection_confidence': det_conf, 'frame_count': fc}}
     
     window_name = "Number Plate Detection - Video Mode"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -602,27 +765,56 @@ def process_video_mode(detector: PlateDetector, video_path: str):
                 ocr_result = result['ocr_result']
                 ocr_results.append(ocr_result)
                 
-                if ocr_result['text']:
-                    # Check if we should capture this vehicle
-                    should_capture, reason = detector.should_capture_vehicle(
-                        ocr_result['text'], img, ocr_result['confidence'], det['confidence'], frame_count
-                    )
+                if ocr_result['text'] and len(ocr_result['text']) >= 4:
+                    # Normalize plate for tracking
+                    normalized_plate = detector.normalize_plate(ocr_result['text'])
                     
-                    if should_capture:
-                        if reason == "new":
-                            print(f"[NEW] Frame {frame_count}: {ocr_result['text']} (conf: {ocr_result['confidence']:.2%})")
-                            snapshot_path = detector.capture_vehicle(
-                                ocr_result['text'], img, det['box'], ocr_result['confidence'], det['confidence'], frame_count
-                            )
-                            detections_logged += 1
-                        elif reason == "better":
-                            print(f"[UPDATE] Frame {frame_count}: {ocr_result['text']} (better quality)")
-                            snapshot_path = detector.update_vehicle_capture(
-                                ocr_result['text'], img, det['box'], ocr_result['confidence'], det['confidence'], frame_count
-                            )
-                    else:
-                        # Already captured - skip but can log for debugging
-                        pass
+                    # Skip if already captured
+                    if normalized_plate in detector.captured_vehicles:
+                        continue
+                    
+                    # Add to consensus
+                    consensus_result = detector.add_to_consensus(normalized_plate, ocr_result['confidence'])
+                    
+                    # Store pending capture with best quality
+                    if normalized_plate not in pending_captures or ocr_result['confidence'] > pending_captures[normalized_plate]['ocr_confidence']:
+                        pending_captures[normalized_plate] = {
+                            'image': img.copy(),
+                            'box': det['box'],
+                            'ocr_confidence': ocr_result['confidence'],
+                            'detection_confidence': det['confidence'],
+                            'frame_count': frame_count,
+                            'plate_text': ocr_result['text']
+                        }
+                    
+                    # Check if we have consensus - require multiple consistent readings
+                    if consensus_result and consensus_result not in detector.captured_vehicles:
+                        # Check if this plate has appeared multiple times
+                        if len(detector.frame_consensus[consensus_result]['readings']) >= 2:
+                            # Get the best pending capture
+                            pending = pending_captures.get(consensus_result)
+                            if pending:
+                                print(f"[CAPTURE] Frame {frame_count}: {consensus_result} (conf: {pending['ocr_confidence']:.2%}, {len(detector.frame_consensus[consensus_result]['readings'])} readings)")
+                                
+                                # Capture the vehicle
+                                snapshot_path = detector.save_snapshot(pending['image'], consensus_result, pending['ocr_confidence'])
+                                detector.log_vehicle(consensus_result, snapshot_path, pending['ocr_confidence'])
+                                
+                                # Mark as captured
+                                detector.captured_vehicles[consensus_result] = {
+                                    'frame': pending['frame_count'],
+                                    'confidence': pending['ocr_confidence'],
+                                    'ocr_confidence': pending['ocr_confidence'],
+                                    'detection_confidence': pending['detection_confidence'],
+                                    'clarity': detector.calculate_image_clarity(pending['image']),
+                                    'snapshot_path': snapshot_path
+                                }
+                                
+                                detections_logged += 1
+                                
+                                # Remove from pending
+                                if consensus_result in pending_captures:
+                                    del pending_captures[consensus_result]
             
             annotated = detector.draw_results(img, detections, ocr_results)
             cv2.imshow(window_name, annotated)
@@ -665,9 +857,13 @@ def process_webcam_mode(detector: PlateDetector, camera_index: int = 0):
     detections_logged = 0
     frame_skip = 10
     
-    # Reset captured vehicles for this session
+    # Reset captured vehicles and consensus for this session
     detector.captured_vehicles = {}
+    detector.frame_consensus = {}
     detector.session_frame_count = 0
+    
+    # Track pending captures (waiting for consensus)
+    pending_captures = {}
     
     window_name = "Number Plate Detection - Webcam Mode"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -697,24 +893,51 @@ def process_webcam_mode(detector: PlateDetector, camera_index: int = 0):
                     ocr_result = result['ocr_result']
                     ocr_results.append(ocr_result)
                     
-                    if ocr_result['text']:
-                        # Check if we should capture this vehicle
-                        should_capture, reason = detector.should_capture_vehicle(
-                            ocr_result['text'], img, ocr_result['confidence'], det['confidence'], frame_count
-                        )
+                    if ocr_result['text'] and len(ocr_result['text']) >= 4:
+                        # Normalize plate for tracking
+                        normalized_plate = detector.normalize_plate(ocr_result['text'])
                         
-                        if should_capture:
-                            if reason == "new":
-                                print(f"[NEW] {ocr_result['text']} (conf: {ocr_result['confidence']:.2%})")
-                                snapshot_path = detector.capture_vehicle(
-                                    ocr_result['text'], img, det['box'], ocr_result['confidence'], det['confidence'], frame_count
-                                )
-                                detections_logged += 1
-                            elif reason == "better":
-                                print(f"[UPDATE] {ocr_result['text']} (better quality)")
-                                snapshot_path = detector.update_vehicle_capture(
-                                    ocr_result['text'], img, det['box'], ocr_result['confidence'], det['confidence'], frame_count
-                                )
+                        # Skip if already captured
+                        if normalized_plate in detector.captured_vehicles:
+                            continue
+                        
+                        # Add to consensus
+                        consensus_result = detector.add_to_consensus(normalized_plate, ocr_result['confidence'])
+                        
+                        # Store pending capture with best quality
+                        if normalized_plate not in pending_captures or ocr_result['confidence'] > pending_captures[normalized_plate]['ocr_confidence']:
+                            pending_captures[normalized_plate] = {
+                                'image': img.copy(),
+                                'box': det['box'],
+                                'ocr_confidence': ocr_result['confidence'],
+                                'detection_confidence': det['confidence'],
+                                'frame_count': frame_count,
+                                'plate_text': ocr_result['text']
+                            }
+                        
+                        # Check for consensus
+                        if consensus_result and consensus_result not in detector.captured_vehicles:
+                            if len(detector.frame_consensus[consensus_result]['readings']) >= 2:
+                                pending = pending_captures.get(consensus_result)
+                                if pending:
+                                    print(f"[CAPTURE] {consensus_result} (conf: {pending['ocr_confidence']:.2%})")
+                                    
+                                    snapshot_path = detector.save_snapshot(pending['image'], consensus_result, pending['ocr_confidence'])
+                                    detector.log_vehicle(consensus_result, snapshot_path, pending['ocr_confidence'])
+                                    
+                                    detector.captured_vehicles[consensus_result] = {
+                                        'frame': pending['frame_count'],
+                                        'confidence': pending['ocr_confidence'],
+                                        'ocr_confidence': pending['ocr_confidence'],
+                                        'detection_confidence': pending['detection_confidence'],
+                                        'clarity': detector.calculate_image_clarity(pending['image']),
+                                        'snapshot_path': snapshot_path
+                                    }
+                                    
+                                    detections_logged += 1
+                                    
+                                    if consensus_result in pending_captures:
+                                        del pending_captures[consensus_result]
                 
                 display_frame = detector.draw_results(img, detections, ocr_results)
         

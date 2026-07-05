@@ -75,6 +75,85 @@ class EvaluationDetector:
         
         # Track unique vehicles to avoid multiple snapshots per vehicle
         self.captured_vehicles = {}  # {plate_number: {'frame': frame_count, 'confidence': confidence, 'clarity': clarity}}
+        
+        # Multi-frame consensus tracking
+        self.frame_consensus = {}
+        self.min_consensus_frames = 2
+    
+    def normalize_plate(self, plate_text: str) -> str:
+        """Normalize plate text for consistent tracking"""
+        if not plate_text:
+            return ""
+        normalized = "".join(c.upper() for c in plate_text if c.isalnum())
+        return normalized
+    
+    def correct_position_based(self, text: str) -> str:
+        """
+        Apply position-aware character corrections for common OCR mistakes.
+        Indian plate format: AA00AA0000
+        """
+        if not text or len(text) < 4:
+            return text
+        
+        text = text.upper().strip()
+        result = []
+        
+        for i, char in enumerate(text):
+            if i < 2 or i > 3 and i < 6:  # Letter positions
+                if char == '2':
+                    result.append('Z')
+                elif char == '0':
+                    result.append('O')
+                elif char == '1':
+                    result.append('I')
+                elif char == '5':
+                    result.append('S')
+                elif char == '8':
+                    result.append('B')
+                else:
+                    result.append(char)
+            else:  # Digit positions
+                if char == 'Z':
+                    result.append('2')
+                elif char == 'O':
+                    result.append('0')
+                elif char == 'I':
+                    result.append('1')
+                elif char == 'S':
+                    result.append('5')
+                elif char == 'B':
+                    result.append('8')
+                else:
+                    result.append(char)
+        
+        return ''.join(result)
+    
+    def validate_indian_plate(self, text: str) -> str:
+        """Validate and format Indian license plate"""
+        if not text:
+            return ""
+        
+        cleaned = "".join(c for c in text.upper() if c.isalnum())
+        
+        if len(cleaned) < 4:
+            return ""
+        
+        corrected = self.correct_position_based(cleaned)
+        
+        # Validate format
+        if len(corrected) == 10:
+            if corrected[:2].isalpha() and corrected[2:4].isdigit() and corrected[4:6].isalpha() and corrected[6:].isdigit():
+                return corrected
+        
+        if len(corrected) == 11:
+            if corrected[:2].isalpha() and corrected[2:4].isdigit() and corrected[4:7].isalpha() and corrected[7:].isdigit():
+                return corrected
+        
+        if len(corrected) == 6:
+            if corrected[:2].isalpha() and corrected[2:].isdigit():
+                return corrected
+        
+        return corrected if corrected.isalnum() else ""
     
     def calculate_image_clarity(self, image) -> float:
         """Calculate image clarity using Laplacian variance (higher = sharper)"""
@@ -208,17 +287,32 @@ class EvaluationDetector:
                 
                 if results:
                     for (bbox, text, prob) in results:
-                        # Clean text
+                        # Clean and validate text with position-aware corrections
                         text = text.strip()
-                        text_clean = "".join(c for c in text if c.isalnum())
+                        text_clean = self.validate_indian_plate(text)
                         
                         if prob > 0.3 and len(text_clean) >= 4:
-                            # Check if we should capture this vehicle (only one snapshot per vehicle)
-                            should_capture, reason = self.should_capture_vehicle(
-                                text_clean, lower_region, prob, frame_count
-                            )
+                            # Normalize for tracking
+                            normalized = self.normalize_plate(text_clean)
                             
-                            if should_capture:
+                            # Check if already captured
+                            if normalized in self.captured_vehicles:
+                                continue
+                            
+                            # Add to consensus
+                            if normalized not in self.frame_consensus:
+                                self.frame_consensus[normalized] = {
+                                    'readings': [],
+                                    'best_confidence': 0,
+                                    'best_text': normalized
+                                }
+                            
+                            self.frame_consensus[normalized]['readings'].append(prob)
+                            if prob > self.frame_consensus[normalized]['best_confidence']:
+                                self.frame_consensus[normalized]['best_confidence'] = prob
+                            
+                            # Only capture if we have consensus
+                            if len(self.frame_consensus[normalized]['readings']) >= self.min_consensus_frames:
                                 # Calculate clarity
                                 clarity = self.calculate_image_clarity(lower_region)
                                 
@@ -243,25 +337,24 @@ class EvaluationDetector:
                                 })
                                 
                                 # Track this vehicle
-                                self.captured_vehicles[text_clean.upper()] = {
+                                self.captured_vehicles[normalized] = {
                                     'frame': frame_count,
                                     'confidence': prob,
                                     'clarity': clarity,
                                     'plate_image_path': str(plate_path)
                                 }
-                            # If not should_capture, we skip saving - vehicle already captured
                             
                             # Log detailed OCR
                             log_entry = {
                                 'video': self.current_video_name,
                                 'frame': frame_count,
-                                'time_sec': timestamp_sec if should_capture else (frame_count / self.current_video_fps),
+                                'time_sec': frame_count / self.current_video_fps,
                                 'bbox': veh['box'],
                                 'raw_ocr': text,
                                 'cleaned_ocr': text_clean,
                                 'confidence': prob,
                                 'valid': len(text_clean) >= 6,
-                                'captured': should_capture
+                                'captured': normalized in self.captured_vehicles
                             }
                             self.detailed_ocr_log.append(log_entry)
                 else:
@@ -326,8 +419,9 @@ class EvaluationDetector:
         self.ocr_attempts = 0
         self.detailed_ocr_log = []
         
-        # Reset captured vehicles for this video session
+        # Reset captured vehicles and consensus for this video session
         self.captured_vehicles = {}
+        self.frame_consensus = {}
         
         frame_skip = 5  # Process every 5th frame for speed
         
